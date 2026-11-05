@@ -47,6 +47,9 @@ type HttpMetadataError = {
   $metadata?: {
     httpStatusCode?: number
   }
+  $response?: {
+    headers?: Record<string, string | undefined>
+  }
 }
 
 const { requestEtagHeaders, responseSMaxAge, responseStaleWhileRevalidate, responseStaleIfError } =
@@ -92,7 +95,10 @@ export abstract class Renderer {
       const metadata = getErrorMetadata(err)
 
       if (metadata?.httpStatusCode === 304) {
+        // The S3 SDK rejects on a 304, so the validators and caching headers a
+        // 200 would carry (RFC 9110 15.4.5) come from the raw upstream response.
         response.header('Vary', GATEWAY_ENCODING_HEADER)
+        this.setNotModifiedHeaders(request, response, getNotModifiedMetadata(err), options)
         return response.status(304).send()
       }
 
@@ -134,21 +140,12 @@ export abstract class Renderer {
     data: AssetResponse,
     options: RenderOptions
   ) {
-    let xRobotsTag = 'none'
-    if (options.xRobotsTag) {
-      try {
-        // allow overriding x-robots-tag header only with valid values
-        validateXRobotsTag(options.xRobotsTag)
-        xRobotsTag = options.xRobotsTag
-      } catch {}
-    }
-
     response
       .status(data.metadata.httpStatusCode ?? 200)
       .header('Accept-Ranges', 'bytes')
       .header('Content-Type', normalizeContentType(data.metadata.mimetype))
       .header('ETag', data.metadata.eTag)
-      .header('X-Robots-Tag', xRobotsTag)
+      .header('X-Robots-Tag', this.resolveXRobotsTag(options))
 
     if (data.metadata.contentEncoding) {
       response.header(
@@ -161,15 +158,7 @@ export abstract class Renderer {
 
     this.setLastModifiedHeader(response, data.metadata.lastModified)
     this.setContentLengthHeader(response, data.metadata.contentLength)
-
-    if (options.expires) {
-      response.header('Expires', options.expires)
-      if (hasCacheControlDirective(data.metadata.cacheControl, 'no-transform')) {
-        response.header('Cache-Control', 'no-transform')
-      }
-    } else {
-      this.handleCacheControl(request, response, data.metadata)
-    }
+    this.setFreshnessHeaders(request, response, data.metadata, options)
 
     const vary = data.metadata.contentEncoding
       ? withEncodingProtocolVary(data.metadata.vary)
@@ -187,6 +176,53 @@ export abstract class Renderer {
     }
 
     this.handleDownload(response, options.download)
+  }
+
+  /**
+   * Sets the headers a 200 would carry that still apply to a 304:
+   * validators, freshness, X-Robots-Tag and Content-Disposition.
+   * No representation headers or body are sent.
+   */
+  protected setNotModifiedHeaders(
+    request: FastifyRequest,
+    response: FastifyReply,
+    metadata: AssetMetadata,
+    options: RenderOptions
+  ) {
+    if (metadata.eTag) {
+      response.header('ETag', metadata.eTag)
+    }
+    this.setLastModifiedHeader(response, metadata.lastModified)
+    response.header('X-Robots-Tag', this.resolveXRobotsTag(options))
+    this.setFreshnessHeaders(request, response, metadata, options)
+    this.handleDownload(response, options.download)
+  }
+
+  protected setFreshnessHeaders(
+    request: FastifyRequest,
+    response: FastifyReply,
+    metadata: AssetMetadata,
+    options: RenderOptions
+  ) {
+    if (options.expires) {
+      response.header('Expires', options.expires)
+      if (hasCacheControlDirective(metadata.cacheControl, 'no-transform')) {
+        response.header('Cache-Control', 'no-transform')
+      }
+    } else {
+      this.handleCacheControl(request, response, metadata)
+    }
+  }
+
+  protected resolveXRobotsTag(options: RenderOptions) {
+    if (options.xRobotsTag) {
+      try {
+        // allow overriding x-robots-tag header only with valid values
+        validateXRobotsTag(options.xRobotsTag)
+        return options.xRobotsTag
+      } catch {}
+    }
+    return 'none'
   }
 
   protected handleDownload(response: FastifyReply, download?: string) {
@@ -397,4 +433,24 @@ function getErrorMetadata(error: unknown): HttpMetadataError['$metadata'] {
   }
 
   return (error as HttpMetadataError).$metadata
+}
+
+function getNotModifiedMetadata(error: unknown): AssetMetadata {
+  const headers =
+    error && typeof error === 'object' ? (error as HttpMetadataError).$response?.headers : undefined
+  const header = (name: string) => {
+    for (const [key, value] of Object.entries(headers ?? {})) {
+      if (key.toLowerCase() === name && value) {
+        return value
+      }
+    }
+  }
+
+  const lastModified = header('last-modified')
+  return {
+    eTag: header('etag'),
+    lastModified: lastModified ? new Date(lastModified) : undefined,
+    // matches the default S3Backend.getObject applies on a 200
+    cacheControl: header('cache-control') || 'no-cache',
+  } as AssetMetadata
 }

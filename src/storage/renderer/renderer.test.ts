@@ -1,9 +1,12 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { createServer, Server } from 'node:http'
+import { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { brotliCompressSync, gzipSync, zstdCompressSync } from 'node:zlib'
 import { GATEWAY_ENCODING_HEADER } from '@internal/http/content-encoding'
 import { FileBackend } from '@storage/backend/file'
+import { S3Backend } from '@storage/backend/s3/adapter'
 import fastify, { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { getConfig } from '../../config'
 import { setErrorHandler } from '../../http/error-handler'
@@ -240,6 +243,187 @@ describe('AssetRenderer public download preconditions', () => {
 
     expect(response.statusCode).toBe(304)
     expect(response.body).toBe('')
+  })
+
+  const s3NotModified = {
+    name: 'NotModified',
+    $metadata: { httpStatusCode: 304 },
+    $response: {
+      headers: {
+        etag: '"abc"',
+        'cache-control': 'public, max-age=3600',
+        'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT',
+      },
+    },
+  }
+
+  it('keeps validators and caching headers on an S3 backend 304', async () => {
+    vi.spyOn(backend, 'getObject').mockRejectedValue(s3NotModified)
+
+    const response = await app.inject({
+      url: '/object/public/bucket/object.txt',
+      headers: { 'if-none-match': '"abc"' },
+    })
+
+    expect(response.statusCode).toBe(304)
+    expect(response.body).toBe('')
+    expect(response.headers.etag).toBe('"abc"')
+    expect(response.headers['cache-control']).toContain('max-age=3600')
+    expect(response.headers['last-modified']).toBe('Wed, 01 Jan 2025 00:00:00 GMT')
+    expect(response.headers['x-robots-tag']).toBe('none')
+    expect(response.headers.vary).toContain(GATEWAY_ENCODING_HEADER)
+    expect(response.headers['content-type']).toBeUndefined()
+    expect(response.headers['accept-ranges']).toBeUndefined()
+  })
+
+  it.each(['report.pdf', 'my file.pdf', ''])(
+    'sends the same Content-Disposition as a 200 on an S3 backend 304 for download=%j',
+    async (download) => {
+      const url = `/object/public/bucket/object.txt?download=${encodeURIComponent(download)}`
+      const original = await app.inject(url)
+      expect(original.statusCode).toBe(200)
+
+      vi.spyOn(backend, 'getObject').mockRejectedValue(s3NotModified)
+      const response = await app.inject({ url, headers: { 'if-none-match': '"abc"' } })
+
+      expect(response.statusCode).toBe(304)
+      expect(response.headers['content-disposition']).toBe(original.headers['content-disposition'])
+      if (download === '') expect(response.headers['content-disposition']).toBe('attachment;')
+    }
+  )
+
+  it('sends no-cache on an S3 backend 304 without upstream Cache-Control, matching a 200', async () => {
+    vi.spyOn(backend, 'getObject').mockRejectedValue({
+      name: 'NotModified',
+      $metadata: { httpStatusCode: 304 },
+      $response: { headers: { ETag: '"abc"' } },
+    })
+
+    const response = await app.inject('/object/public/bucket/object.txt')
+
+    expect(response.statusCode).toBe(304)
+    expect(response.headers.etag).toBe('"abc"')
+    expect(response.headers['cache-control']).toBe('no-cache')
+  })
+})
+
+describe('Renderer S3 backend 304 headers', () => {
+  let app: FastifyInstance
+  let renderer: TestRenderer
+  let options: RenderOptions
+
+  beforeEach(() => {
+    app = fastify()
+    renderer = new TestRenderer()
+    options = { bucket: 'bucket', key: 'object', version: undefined }
+    app.get('/object', (request, reply) => renderer.render(request, reply, options))
+    vi.spyOn(renderer, 'getAsset').mockRejectedValue({
+      $metadata: { httpStatusCode: 304 },
+      $response: {
+        headers: { etag: '"abc"', 'cache-control': 'public, max-age=3600, no-transform' },
+      },
+    })
+  })
+
+  afterEach(async () => {
+    await app.close()
+  })
+
+  it.each([
+    [undefined, 'none'],
+    ['noindex, nofollow', 'noindex, nofollow'],
+    ['not-a-rule', 'none'],
+  ])('sends X-Robots-Tag for override %j as %j', async (xRobotsTag, expected) => {
+    options.xRobotsTag = xRobotsTag
+    const response = await app.inject('/object')
+    expect(response.statusCode).toBe(304)
+    expect(response.headers['x-robots-tag']).toBe(expected)
+  })
+
+  it.each([
+    ['public, max-age=3600, no-transform', 'no-transform'],
+    ['public, max-age=3600', undefined],
+  ])('applies the signed-URL rule to stored %j', async (cacheControl, expected) => {
+    options.expires = 'Thu, 01 Jan 2099 00:00:00 GMT'
+    vi.spyOn(renderer, 'getAsset').mockRejectedValue({
+      $metadata: { httpStatusCode: 304 },
+      $response: { headers: { etag: '"abc"', 'cache-control': cacheControl } },
+    })
+
+    const response = await app.inject('/object')
+
+    expect(response.statusCode).toBe(304)
+    expect(response.headers.expires).toBe(options.expires)
+    expect(response.headers['cache-control']).toBe(expected)
+    expect(response.headers['cache-control']).toBe(
+      new TestRenderer().signedHeaders(cacheControl)['cache-control']
+    )
+  })
+
+  it('keeps a bare 304 when the error carries no raw response', async () => {
+    vi.spyOn(renderer, 'getAsset').mockRejectedValue({ $metadata: { httpStatusCode: 304 } })
+    const response = await app.inject('/object')
+    expect(response.statusCode).toBe(304)
+    expect(response.headers.etag).toBeUndefined()
+    expect(response.headers['last-modified']).toBeUndefined()
+  })
+})
+
+describe('AssetRenderer over S3Backend with an upstream 304', () => {
+  let upstream: Server
+  let backend: S3Backend
+  let app: FastifyInstance
+
+  beforeEach(async () => {
+    vi.stubEnv('AWS_ACCESS_KEY_ID', 'test')
+    vi.stubEnv('AWS_SECRET_ACCESS_KEY', 'test')
+    upstream = createServer((req, res) => {
+      const headers = {
+        ETag: '"abc"',
+        'Cache-Control': 'public, max-age=3600',
+        'Last-Modified': 'Wed, 01 Jan 2025 00:00:00 GMT',
+      }
+      if (req.headers['if-none-match'] === '"abc"') {
+        res.writeHead(304, headers).end()
+      } else {
+        res.writeHead(200, { ...headers, 'Content-Type': 'text/plain' }).end('object bytes')
+      }
+    })
+    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+    const { port } = upstream.address() as AddressInfo
+
+    backend = new S3Backend({
+      endpoint: `http://127.0.0.1:${port}`,
+      forcePathStyle: true,
+      region: 'us-east-1',
+    })
+    const renderer = new AssetRenderer(backend)
+    const options = { bucket: 'bucket', key: 'object.txt', version: undefined }
+    app = fastify()
+    app.get('/object', (request, reply) => renderer.render(request, reply, options))
+  })
+
+  afterEach(async () => {
+    await app.close()
+    backend.close()
+    await new Promise((resolve) => upstream.close(resolve))
+    vi.unstubAllEnvs()
+  })
+
+  it('forwards the upstream validators and Cache-Control', async () => {
+    const original = await app.inject('/object')
+    expect(original.statusCode).toBe(200)
+
+    const response = await app.inject({
+      url: '/object',
+      headers: { 'if-none-match': original.headers.etag as string },
+    })
+
+    expect(response.statusCode).toBe(304)
+    expect(response.body).toBe('')
+    expect(response.headers.etag).toBe('"abc"')
+    expect(response.headers['cache-control']).toBe(original.headers['cache-control'])
+    expect(response.headers['last-modified']).toBe('Wed, 01 Jan 2025 00:00:00 GMT')
   })
 })
 
