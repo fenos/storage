@@ -1,7 +1,11 @@
 import { MultipartFields } from '@fastify/multipart'
 import { ERRORS } from '@internal/errors'
 import { ByteCounterStream } from '@internal/streams'
-import { MAX_PART_SIZE, S3ProtocolHandler } from '@storage/protocols/s3/s3-handler'
+import {
+  MAX_PART_SIZE,
+  parseWriteIfNoneMatch,
+  S3ProtocolHandler,
+} from '@storage/protocols/s3/s3-handler'
 import { fileUploadFromRequest, getStandardMaxFileSizeLimit } from '@storage/uploader'
 import stream, { Readable, Transform } from 'stream'
 import { pipeline } from 'stream/promises'
@@ -36,6 +40,7 @@ const PutObjectInput = {
       'content-disposition': { type: 'string' },
       'content-encoding': { type: 'string' },
       expires: { type: 'string' },
+      'if-none-match': { type: 'string' },
     },
   },
 } as const
@@ -165,6 +170,9 @@ export default function PutObject(s3Router: S3Router) {
     async (req, ctx) => {
       assertGuardedHeadersSigned(req.Headers, ctx.req.signedHeaders, isGuardedAmzHeaderName)
 
+      // Reject an unsupported condition before the body is streamed
+      parseWriteIfNoneMatch(req.Headers['if-none-match'])
+
       const s3Protocol = new S3ProtocolHandler(ctx.storage, ctx.tenantId, ctx.owner)
 
       const metadata = s3Protocol.parseMetadataHeaders(req.Headers)
@@ -205,6 +213,7 @@ export default function PutObject(s3Router: S3Router) {
               Expires: req.Headers?.['expires'] ? new Date(req.Headers?.['expires']) : undefined,
               ContentEncoding: req.Headers?.['content-encoding'],
               Metadata: metadata,
+              IfNoneMatch: req.Headers['if-none-match'],
             },
             {
               signal,

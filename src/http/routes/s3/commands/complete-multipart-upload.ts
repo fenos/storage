@@ -24,6 +24,7 @@ const CompletedMultipartUpload = {
     type: 'object',
     properties: {
       authorization: { type: 'string' },
+      'if-none-match': { type: 'string' },
     },
     additionalProperties: true,
   },
@@ -106,6 +107,7 @@ export default function CompleteMultipartUpload(s3Router: S3Router) {
         MultipartUpload: {
           Parts: req.Body?.CompleteMultipartUpload?.Part || [],
         },
+        IfNoneMatch: req.Headers['if-none-match'],
       })
     }
   )

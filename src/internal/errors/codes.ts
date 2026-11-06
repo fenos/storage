@@ -48,6 +48,7 @@ export enum ErrorCode {
   LockTimeout = 'LockTimeout',
   S3Error = 'S3Error',
   PreconditionFailed = 'PreconditionFailed',
+  NotImplemented = 'NotImplemented',
   S3InvalidAccessKeyId = 'InvalidAccessKeyId',
   S3MaximumCredentialsLimit = 'MaximumCredentialsLimit',
   InvalidChecksum = 'InvalidChecksum',
@@ -427,6 +428,23 @@ export const ERRORS = {
       resource: key,
       httpStatusCode: 400,
       message: `Invalid key: ${key}`,
+      originalError: e,
+    }),
+
+  PreconditionFailed: (e?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.PreconditionFailed,
+      error: 'PreconditionFailed',
+      httpStatusCode: 412,
+      message: 'At least one of the pre-conditions you specified did not hold',
+      originalError: e,
+    }),
+
+  NotImplemented: (message: string, e?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.NotImplemented,
+      httpStatusCode: 501,
+      message,
       originalError: e,
     }),
 

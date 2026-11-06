@@ -1481,6 +1481,174 @@ describe('S3 Protocol', () => {
       })
     })
 
+    describe('Conditional writes (If-None-Match)', () => {
+      const readBody = async (bucket: string, key: string) => {
+        const resp = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
+        return resp.Body?.transformToString()
+      }
+
+      const expectS3Error = async (promise: Promise<unknown>, status: number, name: string) => {
+        const error = await promise.then(
+          () => undefined,
+          (e) => e
+        )
+        expect(error).toBeInstanceOf(S3ServiceException)
+        expect((error as S3ServiceException).$metadata.httpStatusCode).toBe(status)
+        expect((error as S3ServiceException).name).toBe(name)
+      }
+
+      const multipartUpload = async (bucket: string, key: string, body: string) => {
+        const created = await client.send(
+          new CreateMultipartUploadCommand({ Bucket: bucket, Key: key })
+        )
+        const part = await client.send(
+          new UploadPartCommand({
+            Bucket: bucket,
+            Key: key,
+            UploadId: created.UploadId,
+            PartNumber: 1,
+            Body: body,
+            ContentLength: Buffer.byteLength(body),
+          })
+        )
+        return { uploadId: created.UploadId as string, etag: part.ETag }
+      }
+
+      it('PutObject with If-None-Match * creates a new key and rejects an existing one with 412', async () => {
+        const bucket = await createBucket(client)
+        const key = 'state.tflock'
+
+        const created = await client.send(
+          new PutObjectCommand({ Bucket: bucket, Key: key, Body: 'owner=A', IfNoneMatch: '*' })
+        )
+        expect(created.$metadata.httpStatusCode).toBe(200)
+
+        await expectS3Error(
+          client.send(
+            new PutObjectCommand({ Bucket: bucket, Key: key, Body: 'owner=B', IfNoneMatch: '*' })
+          ),
+          412,
+          'PreconditionFailed'
+        )
+
+        expect(await readBody(bucket, key)).toBe('owner=A')
+      })
+
+      it('lets exactly one of several concurrent conditional PutObjects win', async () => {
+        const bucket = await createBucket(client)
+        const key = 'race.tflock'
+        const bodies = ['writer-1', 'writer-2', 'writer-3']
+
+        const results = await Promise.allSettled(
+          bodies.map((Body) =>
+            client.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body, IfNoneMatch: '*' }))
+          )
+        )
+
+        const fulfilled = results.filter((r) => r.status === 'fulfilled')
+        const rejected = results.filter((r) => r.status === 'rejected')
+        expect(fulfilled).toHaveLength(1)
+        expect(rejected).toHaveLength(2)
+        for (const r of rejected) {
+          expect((r.reason as S3ServiceException).$metadata.httpStatusCode).toBe(412)
+          expect((r.reason as S3ServiceException).name).toBe('PreconditionFailed')
+        }
+
+        const winner = bodies[results.findIndex((r) => r.status === 'fulfilled')]
+        expect(await readBody(bucket, key)).toBe(winner)
+      })
+
+      it('rejects If-None-Match values other than * on PutObject', async () => {
+        const bucket = await createBucket(client)
+        const key = 'etag-condition.txt'
+
+        await expectS3Error(
+          client.send(
+            new PutObjectCommand({ Bucket: bucket, Key: key, Body: 'data', IfNoneMatch: '"abc"' })
+          ),
+          501,
+          'NotImplemented'
+        )
+
+        await expectS3Error(
+          client.send(new HeadObjectCommand({ Bucket: bucket, Key: key })),
+          404,
+          'NotFound'
+        )
+      })
+
+      it('CompleteMultipartUpload with If-None-Match * succeeds on a new key', async () => {
+        const bucket = await createBucket(client)
+        const key = 'new-multipart.txt'
+        const { uploadId, etag } = await multipartUpload(bucket, key, 'multipart body')
+
+        const resp = await client.send(
+          new CompleteMultipartUploadCommand({
+            Bucket: bucket,
+            Key: key,
+            UploadId: uploadId,
+            MultipartUpload: { Parts: [{ PartNumber: 1, ETag: etag }] },
+            IfNoneMatch: '*',
+          })
+        )
+        expect(resp.$metadata.httpStatusCode).toBe(200)
+        expect(await readBody(bucket, key)).toBe('multipart body')
+      })
+
+      it('CompleteMultipartUpload with If-None-Match * over an existing object returns 412', async () => {
+        const bucket = await createBucket(client)
+        const key = 'existing-multipart.txt'
+
+        await client.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: 'original' }))
+        const { uploadId, etag } = await multipartUpload(bucket, key, 'replacement')
+
+        await expectS3Error(
+          client.send(
+            new CompleteMultipartUploadCommand({
+              Bucket: bucket,
+              Key: key,
+              UploadId: uploadId,
+              MultipartUpload: { Parts: [{ PartNumber: 1, ETag: etag }] },
+              IfNoneMatch: '*',
+            })
+          ),
+          412,
+          'PreconditionFailed'
+        )
+
+        expect(await readBody(bucket, key)).toBe('original')
+
+        // The upload is left open, as on AWS, so the client can still abort it
+        await client.send(
+          new AbortMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uploadId })
+        )
+      })
+
+      it('rejects If-None-Match values other than * on CompleteMultipartUpload', async () => {
+        const bucket = await createBucket(client)
+        const key = 'etag-condition-multipart.txt'
+        const { uploadId, etag } = await multipartUpload(bucket, key, 'body')
+
+        await expectS3Error(
+          client.send(
+            new CompleteMultipartUploadCommand({
+              Bucket: bucket,
+              Key: key,
+              UploadId: uploadId,
+              MultipartUpload: { Parts: [{ PartNumber: 1, ETag: etag }] },
+              IfNoneMatch: '"abc"',
+            })
+          ),
+          501,
+          'NotImplemented'
+        )
+
+        await client.send(
+          new AbortMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uploadId })
+        )
+      })
+    })
+
     describe('MultiPartUpload', () => {
       it('preserves Content-Encoding after completing S3 multipart upload', async () => {
         const bucket = await createBucket(client)

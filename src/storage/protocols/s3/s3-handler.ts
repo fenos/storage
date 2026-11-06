@@ -87,6 +87,42 @@ export function assertPartsAscending(parts: { PartNumber?: number }[]) {
 }
 
 /**
+ * S3 writes accept only `If-None-Match: *` (create the object only when the key
+ * has no current object). AWS answers any other value with 501 NotImplemented.
+ *
+ * @returns true when the write is conditional
+ */
+export function parseWriteIfNoneMatch(ifNoneMatch: string | undefined) {
+  if (ifNoneMatch === undefined) {
+    return false
+  }
+
+  if (ifNoneMatch.trim() !== '*') {
+    throw ERRORS.NotImplemented(
+      'A header you provided implies functionality that is not implemented: If-None-Match only supports *'
+    )
+  }
+
+  return true
+}
+
+/**
+ * Runs a write that must not replace a live object. The uploader reports an
+ * existing current object as KeyAlreadyExists, which S3 conditional writes
+ * surface as 412 PreconditionFailed.
+ */
+async function asConditionalWrite<T>(isConditional: boolean, fn: () => Promise<T>) {
+  try {
+    return await fn()
+  } catch (e) {
+    if (isConditional && isStorageError(ErrorCode.KeyAlreadyExists, e)) {
+      throw ERRORS.PreconditionFailed(e)
+    }
+    throw e
+  }
+}
+
+/**
  * Version-addressed S3 operations are not supported yet. Silently acting on
  * the current version instead of the requested one serves or deletes the
  * wrong data, so a request that names a versionId is rejected outright.
@@ -727,6 +763,7 @@ export class S3ProtocolHandler {
   async completeMultiPartUpload(command: CompleteMultipartUploadCommandInput) {
     const uploader = new Uploader(this.storage.backend, this.storage.db, this.storage.location)
     const { Bucket, Key, UploadId } = command
+    const isConditional = parseWriteIfNoneMatch(command.IfNoneMatch)
 
     if (!UploadId) {
       throw ERRORS.InvalidUploadId()
@@ -738,14 +775,18 @@ export class S3ProtocolHandler {
 
     assertMultipartUploadIdentity(multiPartUpload, Bucket, Key, UploadId)
 
-    await uploader.canUpload({
-      bucketId: Bucket as string,
-      objectName: Key as string,
-      isUpsert: true,
-      owner: this.owner,
-      userMetadata: multiPartUpload.user_metadata || undefined,
-      metadata: multiPartUpload.metadata || undefined,
-    })
+    // A conditional write over a live object fails here, before the parts are
+    // assembled, so the multipart upload stays open for a retry or an abort.
+    await asConditionalWrite(isConditional, () =>
+      uploader.canUpload({
+        bucketId: Bucket as string,
+        objectName: Key as string,
+        isUpsert: !isConditional,
+        owner: this.owner,
+        userMetadata: multiPartUpload.user_metadata || undefined,
+        metadata: multiPartUpload.metadata || undefined,
+      })
+    )
 
     const parts = command.MultipartUpload?.Parts || []
 
@@ -787,16 +828,28 @@ export class S3ProtocolHandler {
       resp.version
     )
 
-    await uploader.completeUpload({
-      bucketId: Bucket as string,
-      objectName: Key as string,
-      version: resp.version,
-      isUpsert: true,
-      uploadType: 's3',
-      objectMetadata: metadata,
-      owner: this.owner,
-      userMetadata: multiPartUpload.user_metadata || undefined,
-    })
+    try {
+      await asConditionalWrite(isConditional, () =>
+        uploader.completeUpload({
+          bucketId: Bucket as string,
+          objectName: Key as string,
+          version: resp.version,
+          isUpsert: !isConditional,
+          uploadType: 's3',
+          objectMetadata: metadata,
+          owner: this.owner,
+          userMetadata: multiPartUpload.user_metadata || undefined,
+        })
+      )
+    } catch (e) {
+      // A concurrent writer created the key after the early check. The backend
+      // upload has already been assembled (and its bytes removed by the
+      // uploader), so the multipart upload no longer exists to retry.
+      if (isStorageError(ErrorCode.PreconditionFailed, e)) {
+        await this.storage.db.asSuperUser().deleteMultipartUpload(UploadId)
+      }
+      throw e
+    }
 
     await this.storage.db.asSuperUser().deleteMultipartUpload(UploadId)
 
@@ -968,28 +1021,31 @@ export class S3ProtocolHandler {
   ) {
     const uploader = new Uploader(this.storage.backend, this.storage.db, this.storage.location)
     const contentEncoding = validateContentEncoding(command.ContentEncoding)
+    const isConditional = parseWriteIfNoneMatch(command.IfNoneMatch)
 
     mustBeValidBucketName(command.Bucket)
     mustBeValidKey(command.Key)
 
-    const upload = await uploader.upload({
-      bucketId: command.Bucket as string,
-      file: {
-        body: command.Body as Readable,
-        cacheControl: command.CacheControl!,
-        contentEncoding,
-        mimeType: command.ContentType!,
-        contentLength: command.ContentLength,
-        declaredContentLength: options.declaredContentLength,
-        isTruncated: options.isTruncated,
-      },
-      objectName: command.Key as string,
-      userMetadata: command.Metadata,
-      owner: this.owner,
-      isUpsert: true,
-      uploadType: 's3',
-      signal: options.signal,
-    })
+    const upload = await asConditionalWrite(isConditional, () =>
+      uploader.upload({
+        bucketId: command.Bucket as string,
+        file: {
+          body: command.Body as Readable,
+          cacheControl: command.CacheControl!,
+          contentEncoding,
+          mimeType: command.ContentType!,
+          contentLength: command.ContentLength,
+          declaredContentLength: options.declaredContentLength,
+          isTruncated: options.isTruncated,
+        },
+        objectName: command.Key as string,
+        userMetadata: command.Metadata,
+        owner: this.owner,
+        isUpsert: !isConditional,
+        uploadType: 's3',
+        signal: options.signal,
+      })
+    )
 
     return {
       headers: {
