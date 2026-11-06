@@ -14,6 +14,7 @@ import { FileBackend, withOptionalVersion } from '../../backend'
 import type { StorageBackendAdapter } from '../../backend/adapter'
 import { TenantLocation } from '../../locator'
 import { Storage } from '../../storage'
+import { Uploader } from '../../uploader'
 
 vi.mock('fs-xattr', () => ({
   setAttributeSync: vi.fn(),
@@ -1153,6 +1154,161 @@ describe('S3ProtocolHandler.completeMultiPartUpload', () => {
       )
     }
   )
+})
+
+describe('S3ProtocolHandler conditional writes (If-None-Match)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  function createPutHandler() {
+    const storage = { backend: {}, db: {}, location: {} }
+    const handler = new S3ProtocolHandler(storage as never, 'tenant-id')
+    const put = (IfNoneMatch?: string) =>
+      handler.putObject(
+        { Bucket: 'bucket', Key: 'object.txt', Body: Buffer.from('data'), IfNoneMatch },
+        { isTruncated: () => false }
+      )
+    return { put }
+  }
+
+  it.each([
+    ['*', false],
+    [undefined, true],
+  ])(
+    'PutObject with If-None-Match %s calls the uploader with isUpsert %s',
+    async (value, isUpsert) => {
+      const upload = vi
+        .spyOn(Uploader.prototype, 'upload')
+        .mockResolvedValue({ metadata: { eTag: '"etag"' } } as never)
+
+      await expect(createPutHandler().put(value)).resolves.toEqual({ headers: { etag: '"etag"' } })
+      expect(upload).toHaveBeenCalledWith(expect.objectContaining({ isUpsert }))
+    }
+  )
+
+  it('PutObject maps KeyAlreadyExists to PreconditionFailed only for conditional writes', async () => {
+    vi.spyOn(Uploader.prototype, 'upload').mockRejectedValue(ERRORS.KeyAlreadyExists('object.txt'))
+    const { put } = createPutHandler()
+
+    await expect(put('*')).rejects.toMatchObject({
+      code: ErrorCode.PreconditionFailed,
+      httpStatusCode: 412,
+    })
+    await expect(put()).rejects.toMatchObject({
+      code: ErrorCode.KeyAlreadyExists,
+      httpStatusCode: 409,
+    })
+  })
+
+  it('PutObject rejects an If-None-Match value other than * before uploading', async () => {
+    const upload = vi.spyOn(Uploader.prototype, 'upload')
+
+    await expect(createPutHandler().put('"etag"')).rejects.toMatchObject({
+      code: ErrorCode.NotImplemented,
+      httpStatusCode: 501,
+    })
+    expect(upload).not.toHaveBeenCalled()
+  })
+
+  function createCompleteHandler() {
+    const deleteMultipartUpload = vi.fn().mockResolvedValue(undefined)
+    const completeMultipartUpload = vi.fn().mockResolvedValue({ version: 'test-version' })
+    const headObject = vi.fn().mockResolvedValue({})
+    const storage = {
+      backend: { completeMultipartUpload, headObject },
+      db: {
+        asSuperUser: vi.fn(() => ({
+          findMultipartUpload: vi.fn().mockResolvedValue({
+            id: 'test-upload-id',
+            version: 'test-version',
+            user_metadata: null,
+            metadata: null,
+            bucket_id: 'bucket',
+            key: 'object.txt',
+          }),
+          deleteMultipartUpload,
+        })),
+      },
+      location: { getKeyLocation: vi.fn() },
+    }
+    const handler = new S3ProtocolHandler(storage as never, 'tenant-id')
+    const complete = (IfNoneMatch?: string) =>
+      handler.completeMultiPartUpload({
+        Bucket: 'bucket',
+        Key: 'object.txt',
+        UploadId: 'test-upload-id',
+        MultipartUpload: { Parts: [{ PartNumber: 1, ETag: 'etag' }] },
+        IfNoneMatch,
+      })
+    return { complete, completeMultipartUpload, deleteMultipartUpload }
+  }
+
+  it.each([
+    ['*', false],
+    [undefined, true],
+  ])('CompleteMultipartUpload with If-None-Match %s uses isUpsert %s', async (value, isUpsert) => {
+    const canUpload = vi.spyOn(Uploader.prototype, 'canUpload').mockResolvedValue(undefined)
+    const completeUpload = vi
+      .spyOn(Uploader.prototype, 'completeUpload')
+      .mockResolvedValue({} as never)
+    const { complete, deleteMultipartUpload } = createCompleteHandler()
+
+    await complete(value)
+
+    expect(canUpload).toHaveBeenCalledWith(expect.objectContaining({ isUpsert }))
+    expect(completeUpload).toHaveBeenCalledWith(expect.objectContaining({ isUpsert }))
+    expect(deleteMultipartUpload).toHaveBeenCalledWith('test-upload-id')
+  })
+
+  it('CompleteMultipartUpload over a live object fails with 412 before assembling the parts', async () => {
+    vi.spyOn(Uploader.prototype, 'canUpload').mockRejectedValue(
+      ERRORS.KeyAlreadyExists('object.txt')
+    )
+    const { complete, completeMultipartUpload, deleteMultipartUpload } = createCompleteHandler()
+
+    await expect(complete('*')).rejects.toMatchObject({
+      code: ErrorCode.PreconditionFailed,
+      httpStatusCode: 412,
+    })
+    expect(completeMultipartUpload).not.toHaveBeenCalled()
+    expect(deleteMultipartUpload).not.toHaveBeenCalled()
+  })
+
+  it('CompleteMultipartUpload losing a race after assembly fails with 412 and drops the consumed upload', async () => {
+    vi.spyOn(Uploader.prototype, 'canUpload').mockResolvedValue(undefined)
+    vi.spyOn(Uploader.prototype, 'completeUpload').mockRejectedValue(
+      ERRORS.KeyAlreadyExists('object.txt')
+    )
+    const { complete, deleteMultipartUpload } = createCompleteHandler()
+
+    await expect(complete('*')).rejects.toMatchObject({
+      code: ErrorCode.PreconditionFailed,
+      httpStatusCode: 412,
+    })
+    expect(deleteMultipartUpload).toHaveBeenCalledWith('test-upload-id')
+  })
+
+  it('CompleteMultipartUpload keeps KeyAlreadyExists for unconditional writes', async () => {
+    vi.spyOn(Uploader.prototype, 'canUpload').mockRejectedValue(
+      ERRORS.KeyAlreadyExists('object.txt')
+    )
+    const { complete } = createCompleteHandler()
+
+    await expect(complete()).rejects.toMatchObject({ code: ErrorCode.KeyAlreadyExists })
+  })
+
+  it('CompleteMultipartUpload rejects an If-None-Match value other than * before any work', async () => {
+    const canUpload = vi.spyOn(Uploader.prototype, 'canUpload')
+    const { complete, completeMultipartUpload } = createCompleteHandler()
+
+    await expect(complete('"etag"')).rejects.toMatchObject({
+      code: ErrorCode.NotImplemented,
+      httpStatusCode: 501,
+    })
+    expect(canUpload).not.toHaveBeenCalled()
+    expect(completeMultipartUpload).not.toHaveBeenCalled()
+  })
 })
 
 describe('S3ProtocolHandler.listParts', () => {

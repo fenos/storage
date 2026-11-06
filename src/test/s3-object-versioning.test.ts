@@ -1,7 +1,10 @@
 import {
   CreateBucketCommand,
+  DeleteObjectCommand,
   GetBucketVersioningCommand,
+  GetObjectCommand,
   PutBucketVersioningCommand,
+  PutObjectCommand,
   S3Client,
   S3ServiceException,
 } from '@aws-sdk/client-s3'
@@ -221,6 +224,35 @@ describe('S3 object versioning', () => {
       expect((await client.send(new GetBucketVersioningCommand({ Bucket: bucket }))).Status).toBe(
         'Enabled'
       )
+    })
+  })
+
+  describe('conditional writes', () => {
+    it('allows If-None-Match * over a key whose current version is a delete marker', async () => {
+      const bucket = await createBucket('Enabled')
+      const key = 'state.tflock'
+
+      await client.send(
+        new PutObjectCommand({ Bucket: bucket, Key: key, Body: 'owner=A', IfNoneMatch: '*' })
+      )
+
+      const live = await sendError(
+        client.send(
+          new PutObjectCommand({ Bucket: bucket, Key: key, Body: 'owner=B', IfNoneMatch: '*' })
+        )
+      )
+      expect(live.name).toBe('PreconditionFailed')
+      expect(live.$metadata.httpStatusCode).toBe(412)
+
+      await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }))
+
+      const recreated = await client.send(
+        new PutObjectCommand({ Bucket: bucket, Key: key, Body: 'owner=C', IfNoneMatch: '*' })
+      )
+      expect(recreated.$metadata.httpStatusCode).toBe(200)
+
+      const object = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
+      expect(await object.Body?.transformToString()).toBe('owner=C')
     })
   })
 })
